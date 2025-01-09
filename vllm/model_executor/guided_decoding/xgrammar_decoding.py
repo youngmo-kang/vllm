@@ -258,7 +258,7 @@ class XGrammarLogitsProcessor:
         if self.ctx is None:
             compiler = GrammarCompilerCache.get_compiler(self.config)
             if self.config.json_str is not None:
-                self.ctx = compiler.compile_json_schema(self.config.json_str)
+                self.ctx = compiler.compile_json_schema(self.config.json_str, strict_mode=False)
             elif self.config.grammar_str is not None:
                 self.ctx = compiler.compile_grammar(self.config.grammar_str)
             elif self.config.json_object:
