@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 from typing import List, Mapping, Optional, Union
 
@@ -7,7 +9,7 @@ from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalDataDict, MultiModalInputsV2
+from vllm.multimodal.inputs import MultiModalDataDict, MultiModalInputs
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.transformers_utils.tokenizer_group import BaseTokenizerGroup
 
@@ -247,7 +249,7 @@ class InputPreprocessor:
         mm_data: MultiModalDataDict,
         mm_processor_kwargs: Optional[Mapping[str, object]],
         lora_request: Optional[LoRARequest],
-    ) -> MultiModalInputsV2:
+    ) -> MultiModalInputs:
         """
         Apply the model's multi-modal processor to a multi-modal prompt,
         returning the corresponding token IDs and metadata.
@@ -258,8 +260,6 @@ class InputPreprocessor:
         mm_processor = self.mm_registry.create_processor(
             self.model_config, tokenizer)
 
-        if isinstance(prompt, list):
-            prompt = tokenizer.decode(prompt)
         if mm_processor_kwargs is None:
             mm_processor_kwargs = {}
 
@@ -271,7 +271,7 @@ class InputPreprocessor:
         mm_data: MultiModalDataDict,
         mm_processor_kwargs: Optional[Mapping[str, object]],
         lora_request: Optional[LoRARequest],
-    ) -> MultiModalInputsV2:
+    ) -> MultiModalInputs:
         """Async version of :meth:`_process_multimodal`."""
         tokenizer_group = self.get_tokenizer_group()
         tokenizer = await tokenizer_group.get_lora_tokenizer_async(lora_request
@@ -279,10 +279,6 @@ class InputPreprocessor:
 
         mm_processor = self.mm_registry.create_processor(
             self.model_config, tokenizer)
-        if isinstance(prompt, list):
-            logger.warning("Passing `multi_modal_data` in TokensPrompt is"
-                           "deprecated and will be removed in a future update")
-            prompt = tokenizer.decode(prompt)
         if mm_processor_kwargs is None:
             mm_processor_kwargs = {}
 

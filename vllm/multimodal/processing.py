@@ -1,7 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, ItemsView, Iterable, Mapping, Sequence
+from collections.abc import (Callable, Generator, ItemsView, Iterable, Mapping,
+                             Sequence)
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import (TYPE_CHECKING, Generic, NamedTuple, Optional, Protocol,
@@ -18,8 +21,8 @@ from vllm.utils import LRUCache, flatten_2d_lists, full_groupby
 
 from .hasher import MultiModalHasher
 from .inputs import (MultiModalDataDict, MultiModalFieldConfig,
-                     MultiModalInputsV2, MultiModalKwargs,
-                     MultiModalKwargsItem, PlaceholderRange)
+                     MultiModalInputs, MultiModalKwargs, MultiModalKwargsItem,
+                     PlaceholderRange)
 from .parse import MultiModalDataItems, MultiModalDataParser
 
 if TYPE_CHECKING:
@@ -28,23 +31,101 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _S = TypeVar("_S", str, list[int])
-_PromptSeq = Union[str, list[int]]
+
+PromptSeq = Union[str, list[int]]
+"""A token sequence (list of token IDs) or text."""
+
+
+@dataclass
+class PromptReplacementDetails:
+    """Details about the replacement token sequence or text."""
+
+    full: PromptSeq
+    """The full replacement."""
+
+    features: PromptSeq
+    """
+    The part of the replacement that corresponds to feature placeholders;
+    this will be replaced by the output of the vision encoder during model
+    inference.
+    """
+
+    @staticmethod
+    def from_seq(seq: PromptSeq) -> "PromptReplacementDetails":
+        return PromptReplacementDetails(full=seq, features=seq)
+
+
+PromptRepl = Union[PromptSeq, PromptReplacementDetails]
+"""
+The replacement token sequence or text.
+
+If only part of the replacement corresponds to feature placeholders, you can
+use :class:`PromptReplacementDetails` to specify which part.
+"""
 
 
 @dataclass
 class PromptReplacement:
     """
     Defines how to replace portions of an input prompt with placeholder tokens.
+
+    Example:
+
+        For each image, replace one ``<image>`` input placeholder in the prompt
+        with a number of ``<image>`` feature placeholders
+        equal to the feature size of the vision encoder:
+
+        .. code-block:: python
+
+            PromptReplacement(
+                modality="image",
+                target="<image>",
+                replacement="<image>" * image_feature_size,
+            )
+
+        As above, but further pad the feature placeholders with ``<image_bos>``
+        and `<image_eos>``, which are not supposed to be passed to the vision
+        encoder:
+
+        .. code-block:: python
+
+            PromptReplacement(
+                modality="image",
+                target="<image>",
+                replacement=PromptReplacementDetails(
+                    full="".join([
+                        "<image_bos>",
+                        "<image>" * image_feature_size,
+                        "<image_eos>",
+                    ]),
+                    features="<image>" * image_feature_size,
+                ),
+            )
+
+        To avoid unnecessary tokenization during prompt replacement,
+        we recommended passing token sequences instead of text:
+
+        .. code-block:: python
+
+            PromptReplacement(
+                modality="image",
+                target=[image_token_id],
+                replacement=PromptReplacementDetails(
+                    full=([image_bos_id] + [image_token_id] * image_feature_size
+                          + [image_eos_id]),
+                    features=[image_token_id] * image_feature_size,
+                ),
+            )
     """
 
     modality: str
     """The modality for which the replacement is made."""
 
-    target: _PromptSeq
+    target: PromptSeq
     """The token sequence (or text) to find and replace."""
 
-    replacement: Union[Callable[[int], _PromptSeq],
-                       _PromptSeq] = field(repr=False)
+    replacement: Union[Callable[[int], PromptRepl],
+                       PromptRepl] = field(repr=False)
     """
     Given the index of the processed item within :attr:`modality`,
     output the replacement token sequence (or text).
@@ -107,10 +188,25 @@ def full_groupby_modality(values: Iterable[_M]) -> ItemsView[str, list[_M]]:
 
 @dataclass
 class _BoundPromptSequence:
+    """
+    A :data:`_PromptSeq` bound to a tokenizer to automatically
+    convert between token sequence and text representations.
+    """
     tokenizer: AnyTokenizer = field(repr=False)
 
     _text: Optional[str]
     _token_ids: Optional[list[int]]
+
+    @staticmethod
+    def from_seq(
+        tokenizer: AnyTokenizer,
+        seq: PromptSeq,
+    ) -> "_BoundPromptSequence":
+        return _BoundPromptSequence(
+            tokenizer=tokenizer,
+            _text=seq if isinstance(seq, str) else None,
+            _token_ids=seq if isinstance(seq, list) else None,
+        )
 
     def __post_init__(self) -> None:
         if self._text is None and self._token_ids is None:
@@ -135,6 +231,12 @@ class _BoundPromptSequence:
 
 
 @dataclass
+class _BoundPromptReplacementGroup:
+    full: _BoundPromptSequence
+    features: _BoundPromptSequence
+
+
+@dataclass
 class BoundPromptReplacement:
     """
     A :class:`PromptReplacement` bound to a tokenizer to automatically
@@ -144,25 +246,19 @@ class BoundPromptReplacement:
     tokenizer: AnyTokenizer = field(repr=False)
     modality: str
 
-    _target: _PromptSeq
-    _replacement: Union[Callable[[int], _PromptSeq],
-                        _PromptSeq] = field(repr=False)
+    _target: PromptSeq
+    _replacement: Union[Callable[[int], PromptRepl],
+                        PromptRepl] = field(repr=False)
 
     def __post_init__(self) -> None:
-        self._replacement_cache = dict[int, _BoundPromptSequence]()
+        self._replacement_cache = dict[int, _BoundPromptReplacementGroup]()
 
     @property
     def target(self) -> _BoundPromptSequence:
         """The token sequence (or text) to find and replace."""
-        target = self._target
+        return _BoundPromptSequence.from_seq(self.tokenizer, self._target)
 
-        return _BoundPromptSequence(
-            tokenizer=self.tokenizer,
-            _text=target if isinstance(target, str) else None,
-            _token_ids=target if isinstance(target, list) else None,
-        )
-
-    def get_replacement(self, item_idx: int) -> _BoundPromptSequence:
+    def get_replacement(self, item_idx: int) -> _BoundPromptReplacementGroup:
         """
         Given the index of the processed item within :attr:`modality`,
         output the replacement token sequence (or text).
@@ -177,10 +273,16 @@ class BoundPromptReplacement:
         else:
             cache_key = None
 
-        bound_replacement = _BoundPromptSequence(
-            tokenizer=self.tokenizer,
-            _text=replacement if isinstance(replacement, str) else None,
-            _token_ids=replacement if isinstance(replacement, list) else None,
+        if not isinstance(replacement, PromptReplacementDetails):
+            replacement = PromptReplacementDetails.from_seq(replacement)
+
+        bound_full = _BoundPromptSequence.from_seq(self.tokenizer,
+                                                   replacement.full)
+        bound_features = _BoundPromptSequence.from_seq(self.tokenizer,
+                                                       replacement.features)
+        bound_replacement = _BoundPromptReplacementGroup(
+            full=bound_full,
+            features=bound_features,
         )
 
         if cache_key is not None:
@@ -197,7 +299,7 @@ class _TokenMatch(NamedTuple):
 def iter_token_matches(
     token_ids: list[int],
     match_ids: list[int],
-) -> Iterable[_TokenMatch]:
+) -> Generator[_TokenMatch]:
     """
     Yield each occurrence of :code:`match_ids` in :code:`token_ids`.
 
@@ -272,15 +374,15 @@ class _PromptReplacementTextMatch(_PromptReplacementMatch):
 
 
 @dataclass
-class PlaceholderInfo:
+class PlaceholderFeaturesInfo:
     modality: str
     item_idx: int
     start_idx: int
-    replacement: list[int]
+    tokens: list[int]
 
     @property
     def length(self) -> int:
-        return len(self.replacement)
+        return len(self.tokens)
 
     def to_range(self) -> PlaceholderRange:
         return PlaceholderRange(
@@ -314,7 +416,7 @@ def find_text_matches(
 
 
 def _resolve_matches(
-    prompt: _PromptSeq,
+    prompt: PromptSeq,
     mm_matches: Mapping[str, Sequence[_PromptReplacementMatch]],
 ) -> list[_PromptReplacementMatch]:
     """
@@ -362,10 +464,10 @@ def _replace_matches(
         replacement = repl_info.get_replacement(item_idx)
 
         if isinstance(prompt, str):
-            repl_seq = replacement.text
+            repl_seq = replacement.full.text
             out_seqs.append(prompt[prev_end_idx:start_idx] + repl_seq)
         else:
-            repl_seq = replacement.token_ids
+            repl_seq = replacement.full.token_ids
             out_seqs.append(prompt[prev_end_idx:start_idx] + repl_seq)
 
         prev_end_idx = end_idx
@@ -404,78 +506,77 @@ def replace_text_matches(
     return "".join(texts)
 
 
-def _iter_modality_placeholders(
+def _iter_placeholders(
+    mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
     prompt: list[int],
-    modality: str,
-    modality_repls: Sequence[BoundPromptReplacement],
-    modal_item_count: int,
-) -> Iterable[PlaceholderInfo]:
-    if modal_item_count == 0:
-        return
+    mm_item_counts: Mapping[str, int],
+) -> Iterable[PlaceholderFeaturesInfo]:
+    """
+    Yield each set of placeholder tokens found in :code:`prompt`.
 
+    Matches are exclusive even when multiple modalities share
+    the same placeholder tokens. In that case, the modality that
+    appears earlier in `mm_prompt_repls` takes priority.
+
+    Note that empty matches are ignored.
+    """
     prompt_len = len(prompt)
-    item_idx = 0
+    item_idx_by_modality = defaultdict[str, int](lambda: 0)
 
     start_idx = 0
     while start_idx < prompt_len:
         found = False
 
-        for repl_info in modality_repls:
-            replacement = repl_info.get_replacement(item_idx)
-            repl_tokens = replacement.token_ids
-            repl_len = len(repl_tokens)
-            end_idx = start_idx + repl_len
-
-            if repl_len == 0 or end_idx > prompt_len:
+        for modality, modality_repls in mm_prompt_repls.items():
+            item_idx = item_idx_by_modality[modality]
+            if item_idx >= mm_item_counts.get(modality, 0):
                 continue
 
-            if prompt[start_idx:end_idx] == repl_tokens:
-                yield PlaceholderInfo(
-                    modality=modality,
-                    item_idx=item_idx,
-                    start_idx=start_idx,
-                    replacement=repl_tokens,
-                )
+            for repl_info in modality_repls:
+                replacement = repl_info.get_replacement(item_idx)
+                repl_tokens_full = replacement.full.token_ids
+                repl_len_full = len(repl_tokens_full)
+                end_idx_full = start_idx + repl_len_full
 
-                item_idx += 1
-                if item_idx >= modal_item_count:
-                    return
+                if repl_len_full == 0 or end_idx_full > prompt_len:
+                    continue
 
-                # Exclude overlapping matches
-                start_idx = end_idx
-                found = True
-                break
+                if prompt[start_idx:end_idx_full] == repl_tokens_full:
+                    repl_tokens_feat = replacement.features.token_ids
+
+                    try:
+                        match = next(
+                            iter_token_matches(repl_tokens_full,
+                                               repl_tokens_feat))
+                        yield PlaceholderFeaturesInfo(
+                            modality=modality,
+                            item_idx=item_idx,
+                            start_idx=start_idx + match.start_idx,
+                            tokens=repl_tokens_feat,
+                        )
+                    except StopIteration:
+                        raise AssertionError(
+                            f"{repl_tokens_feat=} should be a "
+                            f"subsequence of {repl_tokens_full=}") from None
+
+                    # Exclude overlapping matches
+                    start_idx = end_idx_full
+                    item_idx_by_modality[modality] += 1
+                    found = True
+                    break
+
+            if found:
+                break  # Go back to the outer while loop
 
         if not found:
             start_idx += 1
-
-
-def _iter_placeholders(
-    mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
-    prompt: list[int],
-    mm_item_counts: Mapping[str, int],
-) -> Iterable[PlaceholderInfo]:
-    """
-    For each modality, yield each set of placeholder tokens found in
-    :code:`prompt`.
-
-    Note that empty matches are ignored.
-    """
-    for modality, modal_item_count in mm_item_counts.items():
-        if modality in mm_prompt_repls:
-            yield from _iter_modality_placeholders(
-                prompt,
-                modality,
-                mm_prompt_repls[modality],
-                modal_item_count,
-            )
 
 
 def find_mm_placeholders(
     mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
     prompt: list[int],
     mm_item_counts: Mapping[str, int],
-) -> Mapping[str, list[PlaceholderInfo]]:
+) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
     it = _iter_placeholders(mm_prompt_repls, prompt, mm_item_counts)
     return dict(full_groupby_modality(it))
 
@@ -579,7 +680,11 @@ class BaseProcessingInfo:
         raise NotImplementedError
 
     @abstractmethod
-    def get_mm_max_tokens_per_item(self, seq_len: int) -> Mapping[str, int]:
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
         """
         Get the maximum possible number of tokens per data item
         for each modality.
@@ -620,7 +725,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         prompt: str,
         mm_data: MultiModalDataDict,
         hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> MultiModalInputsV2:
+    ) -> MultiModalInputs:
         return self.apply(prompt, mm_data, hf_processor_mm_kwargs)
 
     def _get_data_parser(self) -> MultiModalDataParser:
@@ -690,7 +795,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
         new_token_ids: list[int],
         mm_item_counts: Mapping[str, int],
-    ) -> Mapping[str, list[PlaceholderInfo]]:
+    ) -> Mapping[str, list[PlaceholderFeaturesInfo]]:
         return find_mm_placeholders(mm_prompt_repls, new_token_ids,
                                     mm_item_counts)
 
@@ -725,15 +830,15 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             mm_kwargs,
         )
 
-    def _apply_hf_processor(
+    def _apply_hf_processor_text_mm(
         self,
         prompt_text: str,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> tuple[list[int], MultiModalKwargs]:
         """
-        Wrapper of :meth:`_call_hf_processor` that applies
-        additional pre-processing and post-processing.
+        Apply the HF processor on the prompt text and multi-modal data
+        together.
         """
         processor_data, passthrough_data = self._get_hf_mm_data(mm_items)
 
@@ -753,40 +858,93 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         return prompt_ids, mm_kwargs
 
-    def _apply_hf_processor_missing(
-        self,
-        prompt_text: str,
-        mm_missing_data_items: MultiModalDataItems,
-        hf_processor_mm_kwargs: Mapping[str, object],
-    ):
+    def _apply_hf_processor_text_only(self, prompt_text: str) -> list[int]:
         """
-        Apply the HF processor on the full prompt text, but only on the
-        multi-modal data that are missing from the cache.
+        Apply the HF processor on the prompt text only.
 
-        Note:
-            We pass prompt text and multi-modal data into the HF processor
-            in separate calls to avoid HF prompt replacement being done for
-            cached items; instead, we rely on our own prompt replacement logic
-            (:meth:`_get_prompt_replacements`) for the full text.
+        Since HF processor requires that text and multi-modal items
+        correspond to each other, we create dummy multi-modal items
+        to go along with the text.
         """
-        mm_missing_counts = mm_missing_data_items.get_all_counts()
-
-        prompt_ids, _ = self._apply_hf_processor(
+        prompt_ids, _ = self._apply_hf_processor_text_mm(
             prompt_text=prompt_text,
             mm_items=MultiModalDataItems({}),
             hf_processor_mm_kwargs={},
         )
 
-        # Some HF processors (e.g. Qwen2-VL) expect corresponding
-        # multi-modal tokens to be in the prompt text
+        return prompt_ids
+
+    def _apply_hf_processor_tokens_only(
+        self,
+        prompt_tokens: list[int],
+    ) -> list[int]:
+        """
+        Apply the HF processor on the prompt tokens only.
+
+        Most HF processors accept prompt text but not prompt tokens.
+        If the HF processor adds or removes tokens that are not related to
+        multi-modal data, you should override this method so it is consistent
+        with the output of :meth:`_apply_hf_processor_text_only` on the
+        corresponding text.
+        """
+        return prompt_tokens
+
+    def _apply_hf_processor_mm_only(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> MultiModalKwargs:
+        """
+        Apply the HF processor on the multi-modal data only.
+
+        Since HF processor requires that text and multi-modal items
+        correspond to each other, we generate dummy text using
+        :class:`DummyInputsBuilder` to go along with the multi-modal data.
+        """
+        mm_counts = mm_items.get_all_counts()
+
         dummy_inputs = self.dummy_inputs.get_dummy_processor_inputs(
             self.info.ctx.model_config.max_model_len,
-            mm_missing_counts,
+            mm_counts,
         )
 
-        _, mm_missing_kwargs = self._apply_hf_processor(
+        _, mm_kwargs = self._apply_hf_processor_text_mm(
             prompt_text=dummy_inputs.prompt_text,
-            mm_items=mm_missing_data_items,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+        )
+
+        return mm_kwargs
+
+    def _apply_hf_processor_main(
+        self,
+        prompt: Union[str, list[int]],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        *,
+        enable_hf_prompt_replacement: bool,
+    ) -> tuple[list[int], MultiModalKwargs]:
+        """
+        Apply the HF processor on the prompt text and multi-modal data.
+
+        Note:
+            If :code:`enable_hf_prompt_replacement=False`, the prompt should
+            correspond to the multi-modal items.
+        """
+        if isinstance(prompt, str):
+            if enable_hf_prompt_replacement:
+                return self._apply_hf_processor_text_mm(
+                    prompt_text=prompt,
+                    mm_items=mm_items,
+                    hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                )
+
+            prompt_ids = self._apply_hf_processor_text_only(prompt)
+        else:
+            prompt_ids = self._apply_hf_processor_tokens_only(prompt)
+
+        mm_missing_kwargs = self._apply_hf_processor_mm_only(
+            mm_items=mm_items,
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
         )
 
@@ -794,7 +952,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
     def _cached_apply_hf_processor(
         self,
-        prompt_text: str,
+        prompt: Union[str, list[int]],
         mm_data_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> tuple[list[int], MultiModalKwargs]:
@@ -807,10 +965,11 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         _, passthrough_data = self._get_hf_mm_data(mm_data_items)
         if cache is None or passthrough_data:
-            return self._apply_hf_processor(
-                prompt_text=prompt_text,
+            return self._apply_hf_processor_main(
+                prompt=prompt,
                 mm_items=mm_data_items,
                 hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+                enable_hf_prompt_replacement=True,
             )
 
         mm_maybe_cached_kw_items = {
@@ -832,10 +991,13 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         }
         mm_missing_data_items = self._to_mm_items(mm_missing_data)
 
-        prompt_ids, mm_missing_kwargs = self._apply_hf_processor_missing(
-            prompt_text=prompt_text,
-            mm_missing_data_items=mm_missing_data_items,
+        # NOTE: `prompt` does not correspond to `mm_missing_data_items`,
+        # so we need to pass `enable_hf_prompt_replacement=False`
+        prompt_ids, mm_missing_kwargs = self._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_missing_data_items,
             hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            enable_hf_prompt_replacement=False,
         )
 
         mm_missing_next_idx = {
@@ -902,7 +1064,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
         token_ids: list[int],
         mm_prompt_repls: Mapping[str, Sequence[BoundPromptReplacement]],
         mm_item_counts: Mapping[str, int],
-    ) -> tuple[list[int], str, Mapping[str, list[PlaceholderInfo]]]:
+    ) -> tuple[list[int], str, Mapping[str, list[PlaceholderFeaturesInfo]]]:
         tokenizer = self.info.get_tokenizer()
 
         mm_token_matches = {
@@ -991,7 +1153,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
     def _validate_mm_placeholders(
         self,
-        mm_placeholders: Mapping[str, list[PlaceholderInfo]],
+        mm_placeholders: Mapping[str, list[PlaceholderFeaturesInfo]],
         mm_item_counts: Mapping[str, int],
         *,
         allow_missing: bool = False,
@@ -1018,10 +1180,10 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
     def apply(
         self,
-        prompt_text: str,
+        prompt: Union[str, list[int]],
         mm_data: MultiModalDataDict,
         hf_processor_mm_kwargs: Mapping[str, object],
-    ) -> MultiModalInputsV2:
+    ) -> MultiModalInputs:
         """
         Process multi-modal inputs to be used in vLLM.
 
@@ -1056,7 +1218,7 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             mm_hashes = None
 
         prompt_ids, mm_kwargs = self._cached_apply_hf_processor(
-            prompt_text,
+            prompt,
             mm_items,
             hf_processor_mm_kwargs,
         )
@@ -1099,14 +1261,14 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
 
         # If HF processor already inserts placeholder tokens,
         # there is no need for us to insert them
-        if all(len(repls) == 0 for repls in mm_missing_repls.items()):
+        if all(len(repls) == 0 for repls in mm_missing_repls.values()):
             tokenizer = self.info.get_tokenizer()
-            prompt_text = decode_tokens(tokenizer, prompt_ids)
+            prompt = decode_tokens(tokenizer, prompt_ids)
             mm_placeholders = hf_mm_placeholders
         else:
             (
                 prompt_ids,
-                prompt_text,
+                prompt,
                 missing_mm_placeholders,
             ) = self._apply_prompt_replacements(
                 prompt_ids,
@@ -1123,9 +1285,9 @@ class BaseMultiModalProcessor(ABC, Generic[_I]):
             for modality, placeholders in mm_placeholders.items()
         }
 
-        return MultiModalInputsV2(
+        return MultiModalInputs(
             type="multimodal",
-            prompt=prompt_text,
+            prompt=prompt,
             prompt_token_ids=prompt_ids,
             mm_kwargs=mm_kwargs,
             mm_hashes=mm_hashes,
